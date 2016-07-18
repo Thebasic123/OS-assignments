@@ -1,0 +1,35 @@
+In this assignment, I decided to create two tables to store information about 
+files, they are File Descriptor table (FD)and Open File Table(OFT) respectively.
+
+Each process has an array of integers which store the indexes of OFT slots, first 3
+FD elements are for STDIN,STDOUT and STDERR by default. I will set those three FD elements at the top of runprogram.c in runprogram function. 
+Multiple FD elements can have same index, they point to same OFT slot, and OFT slot's
+ref_count is the number of FD elements connect to it.
+
+
+OFT is a global array of struct OFT slot, which includes all the information we need, 
+they are number(index of a OFT slot),offset, ref_count, flag and a vnode pointer. 
+I set first two OFT slots as STDOUT and STDERR only, all processes second and third elements can connect to them for STDOUT and STDERR. 
+
+I declare OFT at file.h, they use extern key word to use OFT in different files.
+I initialize OFT in main.c at the bottom of boot function, then I set the first two slots for STDOUT and STDERR after initialization. 
+
+Meanwhile, since OFT is a global data structure, all processes might access it, and they might even access it at the same time. So I created a lock for OFT, it's called OFT_lock.I acquire lock when I use or update data in OFT. 
+
+When fd is passed into function, I can use curproc->fd[fd_input] to find the index of the OFT slot I want to use, then use OFT[index] to find it, since OFT is a global structure.
+
+Therefore, the whole structure looks like this 
+(index of OFT)
+FD--------------OFT-------------VNODE
+
+
+For file functions which I implemented, I declare them in file.h first. Then make a switch case in syscall.c. Those parameters I pass in are from trap frame tf_a0-a3.
+And each function, I will also pass in a pointer to a variable, then I can update that variable then make it as real return value, the actual return value from functions are error code, if function runs correctly, then return 0.
+
+For more information about return values, see man page of those functions. 
+
+The only special case is lseek, since I need to pass in pos which is a 64-bit value.
+
+I am going to follow the instruction on assignment page, use join32to64 and split64to32 to achieve this function.
+
+  

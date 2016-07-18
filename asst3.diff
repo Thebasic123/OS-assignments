@@ -1,0 +1,702 @@
+Index: kern/vm/frametable.c
+===================================================================
+--- kern/vm/frametable.c	(.../initial)	(revision 7)
++++ kern/vm/frametable.c	(.../trunk)	(revision 7)
+@@ -10,8 +10,57 @@
+  * function and call it from vm_bootstrap
+  */
+ 
++// each entry uses n bytes 
++struct frame_table_entry{
++    bool isFree;
++    // if 0, frame is locked, otherwise frame is not looked
++    // we only lock frames which allocate by OS
++    paddr_t address;
++};
++
+ static struct spinlock stealmem_lock = SPINLOCK_INITIALIZER;
++static struct spinlock frame_lock = SPINLOCK_INITIALIZER;
++int total_frame_number = 0;
++char hasInitialized = 0;
+ 
++void ft_initialization(void){
++    // find location for frame table first
++    vaddr_t location = 0;
++    paddr_t ram_size = ram_getsize();
++    paddr_t first = ram_getfirstfree();
++    int ft_frames = 0;//frames used by frame table
++    //int os_frames = 0; //frames used by os at the beginning 
++    int size_of_ft_entry = 0;
++    size_of_ft_entry = sizeof(struct frame_table_entry);
++    //number of total page frames
++    total_frame_number = (ram_size - first)/PAGE_SIZE;
++
++    if((total_frame_number*size_of_ft_entry)% PAGE_SIZE == 0){
++      ft_frames = total_frame_number*size_of_ft_entry/PAGE_SIZE;
++    }else{
++      ft_frames = (total_frame_number*size_of_ft_entry/PAGE_SIZE) + 1;
++    }
++    location = ram_size - (total_frame_number*size_of_ft_entry);
++    frame_table = (struct frame_table_entry *)(PADDR_TO_KVADDR(location));
++   	//initialize all frame paddr
++   	for(int i = 0;i<total_frame_number;i++){
++   		if(i == 0){
++   			frame_table[0].isFree = true;
++   			frame_table[0].address = (first & PAGE_FRAME) + PAGE_SIZE;
++        //frame_table[0].locked = 0;
++   		}else {
++        frame_table[i].isFree = true;
++        frame_table[i].address = frame_table[i-1].address + PAGE_SIZE;
++       // frame_table[0].locked = 0;
++      }
++   	}
++
++   	for(int i=0;i<ft_frames;i++){
++   		frame_table[total_frame_number-1-i].isFree = false;
++   	}
++    hasInitialized = 1;
++}
++
+ /* Note that this function returns a VIRTUAL address, not a physical 
+  * address
+  * WARNING: this function gets called very early, before
+@@ -20,26 +69,82 @@
+  * frame table has been initialised and call ram_stealmem() otherwise.
+  */
+ 
++//get index of first free frame in frame table
++//currently haven't implemented replacement policy like FIFO
++paddr_t get_frame_address(void){
++  paddr_t result = 0;
++  int has_found = 0;//if we havn't found index, set to 0,otherwise to 1
++  //if there is a free page in frame table
++  //spinlock_acquire(&frame_lock);
++  for(int i=0;i<total_frame_number;i++){
++    spinlock_acquire(&frame_lock);
++    if(frame_table[i].isFree==true){
++      result = frame_table[i].address;
++      frame_table[i].isFree = false;
++      has_found = 1;
++      spinlock_release(&frame_lock);
++      break;
++    }
++    spinlock_release(&frame_lock);
++  }
++  //spinlock_release(&frame_lock);
++  if(has_found == 0 && result == 0){//we haven't found, implement replacement policy
++    //TODO
++   // panic("frame table full\n");
++    return ENOMEM;
++  }
++  return result;
++}
++
++
++
+ vaddr_t alloc_kpages(unsigned int npages)
+ {
+-	/*
+-	 * IMPLEMENT ME.  You should replace this code with a proper implementation.
+-	 */
++  /*
++   * IMPLEMENT ME.  You should replace this code with a proper implementation.
++   */
+ 
+-	paddr_t addr;
++  //if frame table hasn't been initialized, we need to call ram_stealmem
++  //otherwise, we just need to collect a page(frame)
+ 
+-	spinlock_acquire(&stealmem_lock);
+-	addr = ram_stealmem(npages);
+-	spinlock_release(&stealmem_lock);
++  paddr_t addr;
++  vaddr_t result;
++  //int index = 0;
++  // if we have initialized frame table, just use FT
++  if(hasInitialized == 1){
++    addr = get_frame_address();
++  }else{
++    spinlock_acquire(&stealmem_lock);
++    addr = ram_stealmem(npages);
++    spinlock_release(&stealmem_lock);
++  }
+ 
+-	if(addr == 0)
+-		return 0;
+-
+-	return PADDR_TO_KVADDR(addr);
++  if(addr == 0)
++    return 0;
++  result = PADDR_TO_KVADDR(addr);
++  bzero((void *)result,PAGE_SIZE);
++  //we need to zero out the page we collect
++  return result;
+ }
+ 
++
+ void free_kpages(vaddr_t addr)
+ {
+-	(void) addr;
++  paddr_t target = 0;
++  target = KVADDR_TO_PADDR(addr);
++  for(int i=0;i<total_frame_number;i++){
++    spinlock_acquire(&frame_lock);
++    if(frame_table[i].address==target){
++      frame_table[i].isFree=true;
++     spinlock_release(&frame_lock);
++      break;
++    }
++   spinlock_release(&frame_lock);
++  }
+ }
+ 
++
++
++
++
++
+Index: kern/vm/vm.c
+===================================================================
+--- kern/vm/vm.c	(.../initial)	(revision 7)
++++ kern/vm/vm.c	(.../trunk)	(revision 7)
+@@ -5,6 +5,10 @@
+ #include <addrspace.h>
+ #include <vm.h>
+ #include <machine/tlb.h>
++#include <current.h>
++#include <proc.h>
++#include <spl.h>
++#include <elf.h>
+ 
+ /* Place your page table functions here */
+ 
+@@ -14,17 +18,117 @@
+     /* Initialise VM sub-system.  You probably want to initialise your 
+        frame table here as well.
+     */
++    ft_initialization();
+ }
+ 
+ int
+ vm_fault(int faulttype, vaddr_t faultaddress)
+ {
+-    (void) faulttype;
+-    (void) faultaddress;
++    //if we have READONLY fault, just return error type
++    if(faulttype == VM_FAULT_READONLY){
++        //panic("READONLY\n");
++        return EFAULT;
++    }
++    if(faultaddress == 0){
++        //panic("null should work\n");
++        return EFAULT;
++    }
++    //if current process's addrspace is not set, then return directly
++    if(proc_getas() == NULL){
++       // panic("NULL as\n");
++        return EFAULT;
++    }
++    // check region is valid or not
++     int valid_region = 0; // if region is valid, we set it to 1
++     struct region_element * current;
++     struct addrspace * as = proc_getas();
++     current = as->head_region;
++     //int flag = 0;
++    uint32_t test_address = faultaddress & PAGE_FRAME;
++    while(current != NULL){
++        vaddr_t top = current->vbase + (current->npages * PAGE_SIZE);
++        if(test_address < top && test_address >= current->vbase){
++       //     flag = current->permission;
++            valid_region = 1;
++        }
++        current = current->next;
++    }
++    if(valid_region == 0){
++      //`  panic("invalid region\n");
++        return EFAULT;
++    }
++    // check permission
++    //if we try to read but no read permission
++    // if(faulttype == VM_FAULT_READ){
++    //     if(!(flag & PF_R)){
++    //         panic("r flag\n");
++    //         return EFAULT;
++    //     }
++    // }
++    // if(faulttype == VM_FAULT_WRITE){
++    //     if(!(flag & PF_W)){
++    //         panic("w flag\n");
++    //         return EFAULT;
++    //     }
++    // }
+ 
+-    panic("vm_fault hasn't been written yet\n");
++    //if we try to write but no write permission
+ 
+-    return EFAULT;
++    //get index of page table element first
++    int first_page_index;
++    int second_page_index;
++    PTE ** pagetable;
++    pagetable = as->pagetable;
++    first_page_index = faultaddress >> 22;
++    second_page_index = (faultaddress >> 12) & 0x3ff;
++    //check whehter page entry exists or not
++    //since pagetable is a lazy structure, 
++    //we will allocate if it doesn't exist
++    if(pagetable[first_page_index]==NULL){
++        pagetable[first_page_index] = (PTE *)alloc_kpages(1);
++    }
++    // if we don't entry, we need to make one for it
++    if(pagetable[first_page_index][second_page_index]== 0){
++        //first 20 bits for frame number
++        //int frame = get_frame_index();
++        paddr_t temp = get_frame_address();
++        //uint32_t entry = 0;
++        //entry = KVADDR_TO_PADDR(temp);
++        //frame = frame * 4096;
++        if(temp == 0){ // memory is full
++            //panic("no memory for page table\n");
++            return ENOMEM;
++        }
++       // entry = temp | TLBLO_VALID;
++        //entry = entry | TLBLO_DIRTY;
++        pagetable[first_page_index][second_page_index] = temp;
++    }
++    int spl = splhigh();
++    //invalid TODO
++
++    //pick a random entry and replace it
++    uint32_t entryHi = faultaddress & PAGE_FRAME;
++    uint32_t entryLo = pagetable[first_page_index][second_page_index] | TLBLO_VALID | TLBLO_DIRTY;
++   // uint32_t testHi = 0;
++    //uint32_t testLo = 0;
++    //kprintf("searching\n");
++    // int tlb_index = 1000; // using some oversize number
++    // for(int i=0;i<NUM_TLB;i++){
++    //     tlb_read(&testHi,&testLo,i);
++    //     if(!(testLo & TLBLO_VALID)){
++    //         tlb_index = i;
++    //         break;
++    //     }
++    // }
++    // if(tlb_index == 1000){
++    //     tlb_random(entryHi,entryLo);
++    // }else{
++    //     tlb_write(entryHi,entryLo,tlb_index);
++    // }
++    tlb_random(entryHi,entryLo);
++    splx(spl);
++    return 0;
++
+ }
+ 
+ /*
+Index: kern/vm/addrspace.c
+===================================================================
+--- kern/vm/addrspace.c	(.../initial)	(revision 7)
++++ kern/vm/addrspace.c	(.../trunk)	(revision 7)
+@@ -37,7 +37,7 @@
+ #include <addrspace.h>
+ #include <vm.h>
+ #include <proc.h>
+-
++#include <elf.h>
+ /*
+  * Note! If OPT_DUMBVM is set, as is the case until you start the VM
+  * assignment, this file is not compiled or linked or in any way
+@@ -55,6 +55,7 @@
+ 
+ 	as = kmalloc(sizeof(struct addrspace));
+ 	if (as == NULL) {
++		//panic("null as 1\n");
+ 		return NULL;
+ 	}
+ 
+@@ -61,6 +62,16 @@
+ 	/*
+ 	 * Initialize as needed.
+ 	 */
++	as->head_region = NULL;
++	//as->vstackbase = 0;
++	as->isPrepared = 0;
++	//we use one page for page table, each entry is 4bytes 
++	//so we should have 1024 elements in page table including 1levle and 2level
++	as->pagetable = (PTE **)alloc_kpages(1);
++	//page table is a lazy strucutre, so we assign null pointers when we initialize
++	for(int i=0;i<1024;i++){
++		as->pagetable[i] = NULL;
++	}
+ 
+ 	return as;
+ }
+@@ -72,6 +83,7 @@
+ 
+ 	newas = as_create();
+ 	if (newas==NULL) {
++		panic("null as 2\n");
+ 		return ENOMEM;
+ 	}
+ 
+@@ -78,9 +90,57 @@
+ 	/*
+ 	 * Write this.
+ 	 */
++	kprintf("using wrong shit copy\n");
++	newas->isPrepared = old->isPrepared;
++	//newas->vstackbase = old->vstackbase;
++	//copy page table
++	for(int i=0;i<1024;i++){
++		//newas->pagetable[i] = old->pagetable[i];
++		// if(old->pagetable[i]!= NULL){
++		// 	vaddr_t copy = alloc_kpages(1);
++		// 	if(copy == 0){
++		// 		as_destroy(newas);
++		// 		return ENOMEM;
++		// 	}
++		// 	memmove((void *)copy,(const void *)old->pagetable[i],PAGE_SIZE);
++		// 	newas->pagetable[i] = (PTE *)copy;
++		// }
++		newas->pagetable[i] = NULL;
++	}
+ 
+-	(void)old;
+ 
++	//copy region list
++	//old as headRegion is null then we don't need to do anything
++	// if(old->head_region == NULL){
++	// 	return 0;
++	// }
++	struct region_element * current_old;
++	current_old = old->head_region;
++	struct region_element * current_new;
++	current_new = newas->head_region;
++	while(current_old != NULL){
++		struct region_element * temp = kmalloc(sizeof(struct region_element));
++		if(temp == NULL){
++			as_destroy(newas);
++			//panic("null region 1\n");
++			return ENOMEM;
++		}
++		temp->vbase = current_old->vbase;
++		temp->npages = current_old->npages;
++		temp->permission = current_old->permission;
++		temp->next = NULL;
++		if(newas->head_region == NULL){
++			newas->head_region = temp;
++		}else{
++			current_new = newas->head_region;
++			while(current_new->next != NULL){
++				current_new = current_new->next;
++			}
++			current_new->next = temp;
++		}
++		current_old = current_old->next;
++
++	}
+ 	*ret = newas;
+ 	return 0;
+ }
+@@ -91,13 +151,30 @@
+ 	/*
+ 	 * Clean up as needed.
+ 	 */
++	//free pagetable
++	//free 2-level first
++	for(int i=0;i<1024;i++){
++		if(as->pagetable[i] != NULL){
++			free_kpages((vaddr_t)as->pagetable[i]);
++		}
++	}
+ 
+-	kfree(as);
++	//free 1-level
++	free_kpages((vaddr_t)as->pagetable);
++	//free regions
++	struct region_element * current;
++	while(as->head_region != NULL){
++		current = as->head_region;
++		as->head_region = as->head_region->next;
++		kfree(current);
++	}
++	free_kpages((vaddr_t)as);
+ }
+ 
+ void
+ as_activate(void)
+ {
++	int i, spl;
+ 	struct addrspace *as;
+ 
+ 	as = proc_getas();
+@@ -112,6 +189,14 @@
+ 	/*
+ 	 * Write this.
+ 	 */
++	/* Disable interrupts on this CPU while frobbing the TLB. */
++	spl = splhigh();
++
++	for (i=0; i<NUM_TLB; i++) {
++		tlb_write(TLBHI_INVALID(i), TLBLO_INVALID(), i);
++	}
++
++	splx(spl);
+ }
+ 
+ void
+@@ -134,6 +219,7 @@
+  * moment, these are ignored. When you write the VM system, you may
+  * want to implement them.
+  */
++
+ int
+ as_define_region(struct addrspace *as, vaddr_t vaddr, size_t memsize,
+ 		 int readable, int writeable, int executable)
+@@ -141,14 +227,59 @@
+ 	/*
+ 	 * Write this.
+ 	 */
++	int reminder = memsize % PAGE_SIZE;
++	//vaddr = vaddr - reminder;
++	vaddr &= PAGE_FRAME; // some address has offset
++	vaddr = vaddr - reminder;
++	size_t numberOfPages = 0;
++	if(reminder == 0){
++		numberOfPages = memsize / PAGE_SIZE;
++	}else{
++		numberOfPages = memsize / PAGE_SIZE + 1;
++	}
++	// we need to make sure it points to the base of a page
+ 
+-	(void)as;
+-	(void)vaddr;
+-	(void)memsize;
+-	(void)readable;
+-	(void)writeable;
+-	(void)executable;
+-	return ENOSYS; /* Unimplemented */
++	int flag = 0;
++	if(readable){
++		flag |= PF_R;
++	}
++	if(writeable){
++		flag |= PF_W;
++	}
++	if(executable){
++		flag |= PF_X;
++	}
++	// go through region list, find first null pointer
++	if(as->head_region == NULL){
++		struct region_element * temp;
++		temp = kmalloc(sizeof(struct region_element));
++		if (temp == NULL) { // if we can't create temp then, return error
++			//panic("null region 3\n");
++			return ENOMEM;
++		}
++		temp->vbase = vaddr;
++		temp->npages = numberOfPages;
++		temp->permission = flag;
++		temp->next = NULL;
++		as->head_region = temp;
++		return 0;
++	}
++	struct region_element * current = as->head_region;
++	while(current->next != NULL){
++		current = current->next;
++	}
++	//set current next
++	struct region_element * temp = kmalloc(sizeof(struct region_element));
++	if (temp == NULL) { 
++		//panic("null region 4\n");
++		return ENOMEM;
++	}
++	temp->vbase = vaddr;
++	temp->npages = numberOfPages;
++	temp->permission = flag;
++	temp->next = NULL;
++	current->next = temp;	
++	return 0; 
+ }
+ 
+ int
+@@ -157,8 +288,21 @@
+ 	/*
+ 	 * Write this.
+ 	 */
+-
+-	(void)as;
++	// we are going to prepare the last one in region list and give it write permission
++	region * current;
++	current = as->head_region;
++	while(current->next != NULL){
++		current = current->next;
++	}
++	//prepare current
++	//check whether region is writeable or not, 
++	//if it is writeable already, then do nothing
++	if(current->permission & PF_W){
++		return 0;
++	}else{
++		as->isPrepared = 1;
++		current->permission |= PF_W;
++	}
+ 	return 0;
+ }
+ 
+@@ -169,7 +313,18 @@
+ 	 * Write this.
+ 	 */
+ 
+-	(void)as;
++	//if region was writeable before prepare_load function call
++	//then we shouldn't do anything
++	if(as->isPrepared == 0){
++		return 0;
++	}
++	as->isPrepared = 0;
++	struct region_element * current;
++	current = as->head_region;
++	while(current->next != NULL){
++		current = current->next;
++	}
++	current->permission &= ~PF_W;
+ 	return 0;
+ }
+ 
+@@ -176,15 +331,15 @@
+ int
+ as_define_stack(struct addrspace *as, vaddr_t *stackptr)
+ {
++
+ 	/*
+ 	 * Write this.
+ 	 */
++	as_define_region(as,USERSTACK - 16*4096, 16*4096,
++		 1, 1, 0);
+ 
+-	(void)as;
+-
+ 	/* Initial user-level stack pointer */
+ 	*stackptr = USERSTACK;
+-
++	//stackbase should be stack top - stacksize
+ 	return 0;
+ }
+-
+Index: kern/include/addrspace.h
+===================================================================
+--- kern/include/addrspace.h	(.../initial)	(revision 7)
++++ kern/include/addrspace.h	(.../trunk)	(revision 7)
+@@ -36,7 +36,7 @@
+ 
+ 
+ #include <vm.h>
+-#include "opt-dumbvm.h"
++//#include "opt-dumbvm.h"
+ 
+ struct vnode;
+ 
+@@ -59,6 +59,13 @@
+         paddr_t as_stackpbase;
+ #else
+         /* Put stuff here for your VM system */
++        region * head_region;//region list
++        //don't use it now
++        //vaddr_t vstackbase;
++        char isPrepared; // 0 no 1 yes
++        //also we need page table here
++        PTE **pagetable;
++
+ #endif
+ };
+ 
+Index: kern/include/vm.h
+===================================================================
+--- kern/include/vm.h	(.../initial)	(revision 7)
++++ kern/include/vm.h	(.../trunk)	(revision 7)
+@@ -44,7 +44,21 @@
+ #define VM_FAULT_WRITE       1    /* A write was attempted */
+ #define VM_FAULT_READONLY    2    /* A write to a readonly page was attempted*/
+ 
++struct frame_table_entry * frame_table;
++//each page table entry is a 4bytes data
++typedef uint32_t PTE;
+ 
++typedef struct region_element{
++    vaddr_t vbase;
++    size_t npages;
++    int permission;
++    struct region_element * next;
++} region;
++
++
++// Initialize frame table
++void ft_initialization(void);
++paddr_t get_frame_address(void);
+ /* Initialization function */
+ void vm_bootstrap(void);
+ 
+Index: kern/arch/mips/include/vm.h
+===================================================================
+--- kern/arch/mips/include/vm.h	(.../initial)	(revision 7)
++++ kern/arch/mips/include/vm.h	(.../trunk)	(revision 7)
+@@ -82,7 +82,7 @@
+  * last valid user address.)
+  */
+ #define USERSPACETOP  MIPS_KSEG0
+-
++#define FIXED_SIZE_STACK 16 //stack always uses 16 pages
+ /*
+  * The starting value for the stack pointer at user level.  Because
+  * the stack is subtract-then-store, this can start as the next
+@@ -92,6 +92,7 @@
+  * grows downwards.
+  */
+ #define USERSTACK     USERSPACETOP
++#define USERSTACKSIZE (FIXED_SIZE_STACK*PAGE_SIZE)
+ 
+ /*
+  * Interface to the low-level module that looks after the amount of
+Index: design.txt
+===================================================================
+--- design.txt	(.../initial)	(revision 7)
++++ design.txt	(.../trunk)	(revision 7)
+@@ -1 +1,37 @@
+-Place your design document here.
++For this assignment I mainly used two structures, frame table entries 
++and page table entries. 
++
++Page table
++Page table entry is a 32 bit value, and page table is a 2D array. First level is a pointer to second level, second level is the a basically entryLo. 
++I use first 20 bits to store the physical address which I get from frame table, the rest of 12 bits to store flags.
++
++Frame table
++Frame table entry includes two variables, isFree and address. 
++isFree can indicate whether this frame is available or not, and address stores the physical address of frame table.
++Because OS needs some memory at the very beginning, so I don't really touch those memory for safety issues. I only set my frames from the first available address.
++
++Region element
++In my structure, region list a linked list of region elements. 
++Each region element includes virtual address base, permission of current region
++and the number of pages it uses. Also a pointer to next region.
++
++For address space(as)
++I put a region list ,a page table and a isPrepared variable in it.
++
++When I prepare load program into region, I set write permission to region without write permission and set isPrepared bit. In complete load function, I set it back.
++
++For as_define_stack, I just call as_define_reion, make stack a region in region list.
++For as_define_region,I set vaddr to the bottom of some page and round up memory size.
++And just put other info into a new region element and add it to the bottom of region list.
++
++I just copied as_activate from dumbvm.c
++
++For vm_fault, I first check whether it is readonly fault, if it is then return EFAULT.
++Then I check whether as is null pointer or not.
++Then I also check whether this fault address lies in a valid region or not.
++Then I just use fault address to get the correct index of page table slot, if page table slot doesn't exist, I create it one in vm_fault since page table is LAZY structure.
++If PTE slot does not exist, we allocate a frame to it, and put physical address into PTE.
++So entryHi is faultaddress + mask by PAGE_FRAME
++and entryLo is the PTE slot + those settting bits. 
++At the end, I use tlb_random to write the the entryLo and entryHi to random TLB slot.
++

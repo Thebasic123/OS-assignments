@@ -1,0 +1,37 @@
+For this assignment I mainly used two structures, frame table entries 
+and page table entries. 
+
+Page table
+Page table entry is a 32 bit value, and page table is a 2D array. First level is a pointer to second level, second level is the a basically entryLo. 
+I use first 20 bits to store the physical address which I get from frame table, the rest of 12 bits to store flags.
+
+Frame table
+Frame table entry includes two variables, isFree and address. 
+isFree can indicate whether this frame is available or not, and address stores the physical address of frame table.
+Because OS needs some memory at the very beginning, so I don't really touch those memory for safety issues. I only set my frames from the first available address.
+
+Region element
+In my structure, region list a linked list of region elements. 
+Each region element includes virtual address base, permission of current region
+and the number of pages it uses. Also a pointer to next region.
+
+For address space(as)
+I put a region list ,a page table and a isPrepared variable in it.
+
+When I prepare load program into region, I set write permission to region without write permission and set isPrepared bit. In complete load function, I set it back.
+
+For as_define_stack, I just call as_define_reion, make stack a region in region list.
+For as_define_region,I set vaddr to the bottom of some page and round up memory size.
+And just put other info into a new region element and add it to the bottom of region list.
+
+I just copied as_activate from dumbvm.c
+
+For vm_fault, I first check whether it is readonly fault, if it is then return EFAULT.
+Then I check whether as is null pointer or not.
+Then I also check whether this fault address lies in a valid region or not.
+Then I just use fault address to get the correct index of page table slot, if page table slot doesn't exist, I create it one in vm_fault since page table is LAZY structure.
+If PTE slot does not exist, we allocate a frame to it, and put physical address into PTE.
+So entryHi is faultaddress + mask by PAGE_FRAME
+and entryLo is the PTE slot + those settting bits. 
+At the end, I use tlb_random to write the the entryLo and entryHi to random TLB slot.
+

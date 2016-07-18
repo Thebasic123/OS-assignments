@@ -1,0 +1,622 @@
+Index: kern/include/proc.h
+===================================================================
+--- kern/include/proc.h	(.../initial)	(revision 3)
++++ kern/include/proc.h	(.../trunk)	(revision 3)
+@@ -69,7 +69,9 @@
+ 
+ 	/* VFS */
+ 	struct vnode *p_cwd;		/* current working directory */
+-
++    int fd_table[32]; 
++    //add an array as file descriptor table in each process
++    // each int in fd_table should be 0
+ 	/* add more material here as needed */
+ };
+ 
+Index: kern/include/file.h
+===================================================================
+--- kern/include/file.h	(.../initial)	(revision 3)
++++ kern/include/file.h	(.../trunk)	(revision 3)
+@@ -1,7 +1,23 @@
+ /*
+  * Declarations for file handle and file table management.
+  */
++#include <vfs.h>
++#include <vnode.h>
++#include <synch.h>
++#include <types.h>
++struct openFileSlot{
++    int number;//# of current slot
++    int ref_count;
++    off_t offset;//current unknown
++    int flag;
++    struct vnode *current_vnode;// pointer to a vnode  
++};
++//declare OFT at file.h then I can use it with extern key word at other files like main.c
++// OFT will be initialized in main.c boot function
++struct openFileSlot *of_table;
+ 
++struct lock *OFT_lock;
++
+ #ifndef _FILE_H_
+ #define _FILE_H_
+ 
+@@ -16,5 +32,12 @@
+  */
+ 
+ 
++// oft_index gives index number of open file table to FD table's slot
++int sys_open(const char *filename,int flags,mode_t mode,int *retval);
++int sys_close(int fd);
++int sys_write(int fd,userptr_t buf,size_t nbytes,ssize_t *retval);
++int sys_read(int fd,userptr_t buf,size_t nbytes,ssize_t *retval);
++int sys_dup2(int oldfd,int newfd,int *retval);
++int sys_lseek(int fd,off_t pos,int whence, off_t *retval);
++#endif /* _FILE_H_ */
+ 
+-#endif /* _FILE_H_ */
+Index: kern/main/main.c
+===================================================================
+--- kern/main/main.c	(.../initial)	(revision 3)
++++ kern/main/main.c	(.../trunk)	(revision 3)
+@@ -49,6 +49,7 @@
+ #include <syscall.h>
+ #include <test.h>
+ #include <version.h>
++#include <file.h>
+ #include "autoconf.h"  // for pseudoconfig
+ 
+ 
+@@ -64,6 +65,9 @@
+ extern const int buildversion;
+ extern const char buildconfig[];
+ 
++extern struct openFileSlot *of_table;//array of OF slots
++extern struct lock *OFT_lock;// global lock for OFT
++
+ /*
+  * Copyright message for the OS/161 base code.
+  */
+@@ -139,6 +143,34 @@
+ 	 */
+ 	COMPILE_ASSERT(sizeof(userptr_t) == sizeof(char *));
+ 	COMPILE_ASSERT(sizeof(*(userptr_t)0) == sizeof(char));
++    
++    //initialize OFT
++    //set open file slot number,start from 1 since 0 indicate
++    //empty slot in file descriptor table
++
++	//since we might have a lot processes running at the same time
++    of_table = kmalloc(sizeof(struct openFileSlot)*1000);
++    int i = 0;
++    while(i<32){
++        of_table[i].number = i+1;
++        of_table[i].ref_count=0;
++        of_table[i].flag = 0;
++        of_table[i].offset = 0;
++        of_table[i].current_vnode=NULL;
++        i++;
++    }
++    //set up stdout and stderr as first and second slots in OFT
++    char c1[] = "con:";
++    char c2[] = "con:";
++    int flag = 1;
++    of_table[0].flag=of_table[1].flag=flag;
++    vfs_open(c1,of_table[0].flag,0,&of_table[0].current_vnode);
++    vfs_open(c2,of_table[1].flag,0,&of_table[1].current_vnode);
++    of_table[0].ref_count++;
++    of_table[1].ref_count++;
++
++    //initialize OFT lock for multi processes access OFT data
++    OFT_lock = lock_create("OFT_lock");
+ }
+ 
+ /*
+Index: kern/syscall/file.c
+===================================================================
+--- kern/syscall/file.c	(.../initial)	(revision 3)
++++ kern/syscall/file.c	(.../trunk)	(revision 3)
+@@ -14,8 +14,342 @@
+ #include <file.h>
+ #include <syscall.h>
+ #include <copyinout.h>
++#include <proc.h>
+ 
++
++
+ /*
+  * Add your file-related functions here ...
+  */
+ 
++// use OFT lock, when OFT data is required
++
++int sys_open(const char *filename,int flags,mode_t mode,int *retval){
++
++    //first I need to file an empty slot at current process's FD table
++    int use_slot = 0;//slot index of fdt we are going to use
++    int oft_index = 0;// index number which we will pass into FDT slot
++    for(int i=1;i<32;i++){ // leave first slot 
++        if(curproc->fd_table[i]== 0){
++            use_slot = i;
++            break;
++        }
++        if(i==31&&use_slot!=31){ // if we can't find an empty slot
++            *retval = -1;            
++            return EMFILE; // error message too many open files
++        }   
++    }
++    
++    //then we need to find an empty slot at open file table
++    lock_acquire(OFT_lock);
++    for(int i=2;i<32;i++){ // first two slots are always for stdout and stderr
++	    if(of_table[i].ref_count == 0){
++	        oft_index = of_table[i].number;
++            break;
++        }
++	    if(i==31&&oft_index!=32){
++           *retval = -1; 
++           lock_release(OFT_lock);
++	       return ENFILE;// error message too many open files in system
++	    }
++    }
++    lock_release(OFT_lock);
++	
++    //last step, we need to use vfs_open set up this oft slot
++    int error = 0;
++    lock_acquire(OFT_lock);
++    error=vfs_open((char *)filename,flags,mode,&of_table[oft_index-1].current_vnode);
++    if(error!=0){ // if error is not 0 then return error to result
++        *retval = -1;
++        lock_release(OFT_lock);    
++        return error;
++    }
++    of_table[oft_index-1].ref_count++;
++    of_table[oft_index-1].flag=flags;
++    lock_release(OFT_lock);
++    curproc->fd_table[use_slot] = oft_index;//link fd_table to correct oft slot
++    //set retval 
++    *retval = use_slot;
++    return 0;//sucessfully implement
++}
++//check whether few fd can link to same vnode
++int sys_close(int fd){
++    //check input
++    if(fd<0 || fd>31){
++        return EBADF;//error 
++    }
++    int OFT_index;
++    OFT_index = curproc->fd_table[fd];
++    OFT_index--;//since number is index+1
++    //check index number
++    if(OFT_index<0||OFT_index>31){
++        return EBADF;
++    }    
++    //check whether slot is valid or not 
++    lock_acquire(OFT_lock);     
++    if(of_table[OFT_index].current_vnode==NULL){
++        lock_release(OFT_lock);
++        return EBADF;
++    }
++    
++    //update FD node and OFT slot
++    //not right, I need to keep eyes on ref_count
++    curproc->fd_table[fd]=0;
++    of_table[OFT_index].ref_count--;
++    if(of_table[OFT_index].ref_count==0){
++        vfs_close(of_table[OFT_index].current_vnode);
++        of_table[OFT_index].current_vnode=NULL;
++        of_table[OFT_index].flag = 0;
++        of_table[OFT_index].offset = 0;
++    }else{
++        //do nothing
++    }
++    lock_release(OFT_lock);
++    return 0;//successfully implement
++}
++
++int sys_write(int fd,userptr_t buf,size_t nbytes,ssize_t *retval){
++    //check fd    
++    if(fd<0 || fd>31){
++        *retval = -1;
++        return EBADF;//error 
++    }
++    int OFT_index;
++    OFT_index = curproc->fd_table[fd];
++    OFT_index--;//since number is index+1
++    //check index number
++    if(OFT_index<0||OFT_index>31){
++        *retval = -1;
++        return EBADF;
++    }    
++    //check whether slot is valid or not 
++    lock_acquire(OFT_lock);       
++    if(of_table[OFT_index].current_vnode==NULL){
++        *retval = -1;
++        lock_release(OFT_lock);
++        return EBADF;
++    }
++
++    //check permission
++    if((of_table[OFT_index].flag & (1<<0))||(of_table[OFT_index].flag & (1<<1))){
++    //have permission to write
++    // do nothing
++    }else{// don't have permission
++        *retval = -1;
++        lock_release(OFT_lock);
++        return EACCES;
++    }
++    lock_release(OFT_lock);
++
++    //create uio and iovec for write
++    struct iovec iov;
++    struct uio u;
++    enum uio_rw {UIO_READ,UIO_WRITE} rw = UIO_WRITE; 
++    lock_acquire(OFT_lock);
++    uio_kinit(&iov,&u,buf,nbytes,of_table[OFT_index].offset,rw);
++    size_t old_resid = u.uio_resid;
++    int error;
++    error=VOP_WRITE(of_table[OFT_index].current_vnode,&u);
++    size_t new_resid = u.uio_resid;
++    lock_release(OFT_lock);
++    //the difference between old_resid and new_resid is how many bytes were written
++    if(error==0){
++        *retval = old_resid - new_resid;
++        //update offset
++        lock_acquire(OFT_lock);
++        of_table[OFT_index].offset += *retval;
++        lock_release(OFT_lock); 
++        return 0;
++    }else{
++        *retval = -1;
++        return error;
++    }
++    return 0;//success    
++}
++
++int sys_read(int fd,userptr_t buf,size_t nbytes,ssize_t *retval){
++        //check fd    
++    if(fd<0 || fd>31){
++        *retval = -1;
++        return EBADF;//error 
++    }
++    int OFT_index;
++    OFT_index = curproc->fd_table[fd];
++    OFT_index--;//since number is index+1
++    //check index number
++    if(OFT_index<0||OFT_index>31){
++        *retval = -1;
++        return EBADF;
++    }    
++    //check whether slot is valid or not  
++    lock_acquire(OFT_lock);      
++    if(of_table[OFT_index].current_vnode==NULL){
++        *retval = -1;
++        lock_release(OFT_lock);
++        return EBADF;
++    }
++
++    //check permission
++    int test = of_table[OFT_index].flag;
++    if(((test>>31)==0)||(of_table[OFT_index].flag & (1<<1))){
++    //have permission to write
++    // do nothing
++    }else{
++        // doesn't have permission to write
++        *retval = -1;
++        lock_release(OFT_lock);
++        return EACCES;
++    }
++    lock_release(OFT_lock);
++
++    //create uio and iovec for write
++    struct iovec iov;
++    struct uio u;
++    enum uio_rw {UIO_READ,UIO_WRITE} rw = UIO_READ; 
++    lock_acquire(OFT_lock);
++    uio_kinit(&iov,&u,buf,nbytes,of_table[OFT_index].offset,rw);
++    size_t old_resid = u.uio_resid;
++    int error;
++    error=VOP_READ(of_table[OFT_index].current_vnode,&u);
++    size_t new_resid = u.uio_resid;
++    lock_release(OFT_lock);
++    //the difference between old_resid and new_resid is how many bytes were written
++    if(error==0){
++        *retval = old_resid - new_resid;
++        //update offset
++        lock_acquire(OFT_lock);
++        of_table[OFT_index].offset += *retval; 
++        lock_release(OFT_lock);
++        return 0;
++    }else{
++        *retval = -1;
++        return error;
++    }
++    return 0;//success  
++}
++
++
++
++int sys_dup2(int oldfd,int newfd,int *retval){
++    //check input oldfd like sys_close
++    if(oldfd<0 || oldfd>31){
++        return EBADF;//error 
++    }
++    int OFT_index;
++    OFT_index = curproc->fd_table[oldfd];
++    OFT_index--;//since number is index+1
++    if(OFT_index<0||OFT_index>31){
++        *retval = -1;
++        return EBADF;
++    } 
++    lock_acquire(OFT_lock);
++    if(of_table[OFT_index].current_vnode==NULL){
++        *retval = -1;
++        lock_release(OFT_lock);
++        return EBADF;
++    }
++    lock_release(OFT_lock);
++    
++    //check newfd
++    if(newfd<0 || newfd>31){
++        *retval = -1;
++        return EBADF;
++    }
++    //if newFD != 0, it points to some OFT slot, we need to close it
++    if(curproc->fd_table[newfd]!=0){
++        int error;
++        error = sys_close(newfd);
++        if(error!=0){ // if sys_close didn't set newFD successfully
++            curproc->fd_table[newfd]=0;
++        }
++    }
++    curproc->fd_table[newfd]=OFT_index+1;//give oldfd OFT index number to newfd
++    lock_acquire(OFT_lock);
++    of_table[OFT_index-1].ref_count++;
++    lock_release(OFT_lock);
++    //return value     
++    *retval = newfd;
++    return 0;//successfully implement
++}
++
++int sys_lseek(int fd,off_t pos, int whence,off_t *retval){
++    //check input
++    if(fd<0 || fd>31){
++        *retval=-1;
++        return EBADF;//error 
++    }
++    int OFT_index;
++    OFT_index = curproc->fd_table[fd];
++    OFT_index--;//since number is index+1
++    //check index number
++    if(OFT_index<0||OFT_index>31){
++        *retval=-1;
++        return EBADF;
++    }    
++    //check whether slot is valid or not 
++    lock_acquire(OFT_lock);    
++    if(of_table[OFT_index].current_vnode==NULL){
++        *retval=-1;
++        lock_release(OFT_lock);
++        return EBADF;
++    }
++    lock_release(OFT_lock);
++    //check whence
++    if(whence!=SEEK_SET&&whence!=SEEK_CUR&&whence!=SEEK_END){
++        //invalid whence code
++        *retval=-1;
++        return EINVAL;
++    }
++
++    if(whence==SEEK_SET){
++        if(pos>=0){
++            lock_acquire(OFT_lock);
++            of_table[OFT_index].offset=pos;
++            lock_release(OFT_lock);
++            *retval = pos;
++            return 0;
++        }else{
++            //negative pos
++            *retval = -1;
++            return EINVAL;
++        }
++
++    }
++    if(whence==SEEK_CUR){
++        lock_acquire(OFT_lock);
++        off_t set_cur = of_table[OFT_index].offset + pos;
++        if(set_cur>=0){
++            of_table[OFT_index].offset = set_cur;
++            lock_release(OFT_lock);
++            *retval = set_cur;
++            return 0;
++        }else{
++            //negative pos
++            *retval = -1;
++            lock_release(OFT_lock);
++            return EINVAL;
++        }
++    }
++    if(whence==SEEK_END){
++        //create a pointer for VOP_STAT
++        struct stat ptr;// I don't know what this pointer is for
++        lock_acquire(OFT_lock);
++        off_t end_of_file = VOP_STAT(of_table[OFT_index].current_vnode,&ptr);
++        lock_release(OFT_lock);
++        off_t set_end = end_of_file + pos;
++        if(set_end>=0){
++            lock_acquire(OFT_lock);
++            of_table[OFT_index].offset = set_end;
++            lock_release(OFT_lock);
++            *retval = set_end;
++            return 0;
++        }else{
++            //negative pos
++            *retval = -1;
++            return EINVAL;
++        }
++
++    }
++    return 0;//successfully implement
++}
++
+Index: kern/syscall/runprogram.c
+===================================================================
+--- kern/syscall/runprogram.c	(.../initial)	(revision 3)
++++ kern/syscall/runprogram.c	(.../trunk)	(revision 3)
+@@ -44,7 +44,12 @@
+ #include <vfs.h>
+ #include <syscall.h>
+ #include <test.h>
++#include <file.h>
++#include <proc.h>
+ 
++//create open file table
++extern struct openFileSlot *of_table;
++
+ /*
+  * Load program "progname" and start running it in usermode.
+  * Does not return except on error.
+@@ -53,11 +58,14 @@
+  */
+ int
+ runprogram(char *progname)
+-{
++{       
++    
++
+ 	struct addrspace *as;
+ 	struct vnode *v;
+ 	vaddr_t entrypoint, stackptr;
+ 	int result;
++    
+ 
+ 	/* Open the file. */
+ 	result = vfs_open(progname, O_RDONLY, 0, &v);
+@@ -64,6 +72,10 @@
+ 	if (result) {
+ 		return result;
+ 	}
++	 //put index into f[1] and f[2],first slot and second slot
++    curproc->fd_table[1]=1;
++    curproc->fd_table[2]=2; 
++        
+ 
+ 	/* We should be a new process. */
+ 	KASSERT(proc_getas() == NULL);
+Index: kern/arch/mips/syscall/syscall.c
+===================================================================
+--- kern/arch/mips/syscall/syscall.c	(.../initial)	(revision 3)
++++ kern/arch/mips/syscall/syscall.c	(.../trunk)	(revision 3)
+@@ -35,6 +35,9 @@
+ #include <thread.h>
+ #include <current.h>
+ #include <syscall.h>
++#include <file.h>
++#include <endian.h>
++#include <copyinout.h>
+ 
+ 
+ /*
+@@ -81,6 +84,9 @@
+ 	int callno;
+ 	int32_t retval;
+ 	int err;
++	uint64_t offset;
++	int whence;
++    off_t retval64;
+ 
+ 	KASSERT(curthread != NULL);
+ 	KASSERT(curthread->t_curspl == 0);
+@@ -110,7 +116,32 @@
+ 		break;
+ 
+ 	    /* Add stuff here */
++        case SYS_open:
++        err = sys_open((const char *)tf->tf_a0,(int)tf->tf_a1,0,&retval); 
++        break;
++        
++        case SYS_close:
++        err = sys_close((int)tf->tf_a0);
++        break;        
++        
++        case SYS_write:
++        err = sys_write((int)tf->tf_a0,(userptr_t)tf->tf_a1,(size_t)tf->tf_a2,&retval);
++        break;
+ 
++        case SYS_read:
++       	err = sys_read((int)tf->tf_a0,(userptr_t)tf->tf_a1,(size_t)tf->tf_a2,&retval);
++       	break;
++
++        case SYS_dup2:       
++        err = sys_dup2((int)tf->tf_a0,(int)tf->tf_a1,&retval);
++        break;
++
++        case SYS_lseek:
++        join32to64(tf->tf_a2,tf->tf_a3,&offset);
++        copyin((userptr_t)tf->tf_sp+16,&whence,sizeof(int));
++        err = sys_lseek((int)tf->tf_a0,offset,whence,&retval64);
++        break;
++
+ 	    default:
+ 		kprintf("Unknown syscall %d\n", callno);
+ 		err = ENOSYS;
+@@ -117,7 +148,6 @@
+ 		break;
+ 	}
+ 
+-
+ 	if (err) {
+ 		/*
+ 		 * Return the error code. This gets converted at
+@@ -131,6 +161,9 @@
+ 		/* Success. */
+ 		tf->tf_v0 = retval;
+ 		tf->tf_a3 = 0;      /* signal no error */
++		if(callno==SYS_lseek){//if function call is lseek
++			split64to32(retval64,&tf->tf_v0,&tf->tf_v1);
++		}
+ 	}
+ 
+ 	/*
+Index: design.txt
+===================================================================
+--- design.txt	(.../initial)	(revision 3)
++++ design.txt	(.../trunk)	(revision 3)
+@@ -1 +1,35 @@
+-Place your design document here.
++In this assignment, I decided to create two tables to store information about 
++files, they are File Descriptor table (FD)and Open File Table(OFT) respectively.
++
++Each process has an array of integers which store the indexes of OFT slots, first 3
++FD elements are for STDIN,STDOUT and STDERR by default. I will set those three FD elements at the top of runprogram.c in runprogram function. 
++Multiple FD elements can have same index, they point to same OFT slot, and OFT slot's
++ref_count is the number of FD elements connect to it.
++
++
++OFT is a global array of struct OFT slot, which includes all the information we need, 
++they are number(index of a OFT slot),offset, ref_count, flag and a vnode pointer. 
++I set first two OFT slots as STDOUT and STDERR only, all processes second and third elements can connect to them for STDOUT and STDERR. 
++
++I declare OFT at file.h, they use extern key word to use OFT in different files.
++I initialize OFT in main.c at the bottom of boot function, then I set the first two slots for STDOUT and STDERR after initialization. 
++
++Meanwhile, since OFT is a global data structure, all processes might access it, and they might even access it at the same time. So I created a lock for OFT, it's called OFT_lock.I acquire lock when I use or update data in OFT. 
++
++When fd is passed into function, I can use curproc->fd[fd_input] to find the index of the OFT slot I want to use, then use OFT[index] to find it, since OFT is a global structure.
++
++Therefore, the whole structure looks like this 
++(index of OFT)
++FD--------------OFT-------------VNODE
++
++
++For file functions which I implemented, I declare them in file.h first. Then make a switch case in syscall.c. Those parameters I pass in are from trap frame tf_a0-a3.
++And each function, I will also pass in a pointer to a variable, then I can update that variable then make it as real return value, the actual return value from functions are error code, if function runs correctly, then return 0.
++
++For more information about return values, see man page of those functions. 
++
++The only special case is lseek, since I need to pass in pos which is a 64-bit value.
++
++I am going to follow the instruction on assignment page, use join32to64 and split64to32 to achieve this function.
++
++  
+\ No newline at end of file

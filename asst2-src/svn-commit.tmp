@@ -1,0 +1,10 @@
+
+--This line, and those below, will be ignored--
+
+M    design.txt
+M    kern/arch/mips/syscall/syscall.c
+M    kern/include/file.h
+M    kern/include/proc.h
+M    kern/main/main.c
+M    kern/syscall/file.c
+M    kern/syscall/runprogram.c

@@ -1,0 +1,145 @@
+#include <types.h>
+#include <kern/errno.h>
+#include <lib.h>
+#include <thread.h>
+#include <addrspace.h>
+#include <vm.h>
+#include <machine/tlb.h>
+#include <current.h>
+#include <proc.h>
+#include <spl.h>
+#include <elf.h>
+
+/* Place your page table functions here */
+
+
+void vm_bootstrap(void)
+{
+    /* Initialise VM sub-system.  You probably want to initialise your 
+       frame table here as well.
+    */
+    ft_initialization();
+}
+
+int
+vm_fault(int faulttype, vaddr_t faultaddress)
+{
+    //if we have READONLY fault, just return error type
+    if(faulttype == VM_FAULT_READONLY){
+        //panic("READONLY\n");
+        return EFAULT;
+    }
+    if(faultaddress == 0){
+        //panic("null should work\n");
+        return EFAULT;
+    }
+    //if current process's addrspace is not set, then return directly
+    if(proc_getas() == NULL){
+       // panic("NULL as\n");
+        return EFAULT;
+    }
+    // check region is valid or not
+     int valid_region = 0; // if region is valid, we set it to 1
+     struct region_element * current;
+     struct addrspace * as = proc_getas();
+     current = as->head_region;
+     //int flag = 0;
+    uint32_t test_address = faultaddress & PAGE_FRAME;
+    while(current != NULL){
+        vaddr_t top = current->vbase + (current->npages * PAGE_SIZE);
+        if(test_address < top && test_address >= current->vbase){
+       //     flag = current->permission;
+            valid_region = 1;
+        }
+        current = current->next;
+    }
+    if(valid_region == 0){
+      //`  panic("invalid region\n");
+        return EFAULT;
+    }
+    // check permission
+    //if we try to read but no read permission
+    // if(faulttype == VM_FAULT_READ){
+    //     if(!(flag & PF_R)){
+    //         panic("r flag\n");
+    //         return EFAULT;
+    //     }
+    // }
+    // if(faulttype == VM_FAULT_WRITE){
+    //     if(!(flag & PF_W)){
+    //         panic("w flag\n");
+    //         return EFAULT;
+    //     }
+    // }
+
+    //if we try to write but no write permission
+
+    //get index of page table element first
+    int first_page_index;
+    int second_page_index;
+    PTE ** pagetable;
+    pagetable = as->pagetable;
+    first_page_index = faultaddress >> 22;
+    second_page_index = (faultaddress >> 12) & 0x3ff;
+    //check whehter page entry exists or not
+    //since pagetable is a lazy structure, 
+    //we will allocate if it doesn't exist
+    if(pagetable[first_page_index]==NULL){
+        pagetable[first_page_index] = (PTE *)alloc_kpages(1);
+    }
+    // if we don't entry, we need to make one for it
+    if(pagetable[first_page_index][second_page_index]== 0){
+        //first 20 bits for frame number
+        //int frame = get_frame_index();
+        paddr_t temp = get_frame_address();
+        //uint32_t entry = 0;
+        //entry = KVADDR_TO_PADDR(temp);
+        //frame = frame * 4096;
+        if(temp == 0){ // memory is full
+            //panic("no memory for page table\n");
+            return ENOMEM;
+        }
+       // entry = temp | TLBLO_VALID;
+        //entry = entry | TLBLO_DIRTY;
+        pagetable[first_page_index][second_page_index] = temp;
+    }
+    int spl = splhigh();
+    //invalid TODO
+
+    //pick a random entry and replace it
+    uint32_t entryHi = faultaddress & PAGE_FRAME;
+    uint32_t entryLo = pagetable[first_page_index][second_page_index] | TLBLO_VALID | TLBLO_DIRTY;
+   // uint32_t testHi = 0;
+    //uint32_t testLo = 0;
+    //kprintf("searching\n");
+    // int tlb_index = 1000; // using some oversize number
+    // for(int i=0;i<NUM_TLB;i++){
+    //     tlb_read(&testHi,&testLo,i);
+    //     if(!(testLo & TLBLO_VALID)){
+    //         tlb_index = i;
+    //         break;
+    //     }
+    // }
+    // if(tlb_index == 1000){
+    //     tlb_random(entryHi,entryLo);
+    // }else{
+    //     tlb_write(entryHi,entryLo,tlb_index);
+    // }
+    tlb_random(entryHi,entryLo);
+    splx(spl);
+    return 0;
+
+}
+
+/*
+ *
+ * SMP-specific functions.  Unused in our configuration.
+ */
+
+void
+vm_tlbshootdown(const struct tlbshootdown *ts)
+{
+	(void)ts;
+	panic("vm tried to do tlb shootdown?!\n");
+}
+
